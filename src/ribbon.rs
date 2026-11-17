@@ -416,13 +416,21 @@ fn subclass_combo(cb: HWND, id: u32) {
         ) -> LRESULT {
             unsafe {
                 if msg == WM_KEYDOWN && wp.0 == VK_RETURN.0 as usize {
-                    let parent = GetParent(hwnd).unwrap_or_default();
-                    // forward as CBN_SELCHANGE so the app applies the typed value
+                    // hwnd may be the inner EDIT control of the combobox —
+                    // climb to the combobox, then to the main window
+                    let mut p = GetParent(hwnd).unwrap_or_default(); // combobox or ribbon
+                    let mut grand = GetParent(p).unwrap_or_default(); // ribbon or main
+                    if grand.0.is_null() {
+                        grand = p;
+                        p = hwnd;
+                    }
+                    // when called on the edit child, `p` is the combobox and
+                    // its window text is the value the app should read
                     SendMessageW(
-                        GetParent(parent).unwrap_or(parent),
+                        grand,
                         WM_COMMAND,
                         WPARAM(((CBN_SELCHANGE as usize) << 16) | data),
-                        LPARAM(hwnd.0 as isize),
+                        LPARAM(p.0 as isize),
                     );
                     return LRESULT(0);
                 }
@@ -431,6 +439,13 @@ fn subclass_combo(cb: HWND, id: u32) {
         }
         let _ = SetWindowSubclass(cb, Some(proc), NEXT_SUBCLASS, id as usize);
         NEXT_SUBCLASS += 1;
+        // keys typed into a CBS_DROPDOWN combo go to its inner EDIT child —
+        // subclass it too, with the same forwarding proc
+        let edit = GetWindow(cb, GW_CHILD).unwrap_or_default();
+        if !edit.0.is_null() {
+            let _ = SetWindowSubclass(edit, Some(proc), NEXT_SUBCLASS, id as usize);
+            NEXT_SUBCLASS += 1;
+        }
     }
 }
 
@@ -471,7 +486,10 @@ fn layout_body(s: &mut RibbonState, w: i32) {
     for (gi, g) in tab.groups.iter().enumerate() {
         let gx = x;
         let mut col_x = gx;
-        let mut row = 0;
+        // groups containing combos reserve row 0 for the combo strip —
+        // buttons start one row lower so the child HWNDs don't cover them
+        let has_combo = g.items.iter().any(|i| i.combo.is_some());
+        let mut row = if has_combo { 1 } else { 0 };
         for (ii, it) in g.items.iter().enumerate() {
             match it.style {
                 Style::Large => {
@@ -486,7 +504,7 @@ fn layout_body(s: &mut RibbonState, w: i32) {
                 }
                 Style::Small => {
                     if row == 3 {
-                        row = 0;
+                        row = if has_combo { 1 } else { 0 };
                         col_x += 30;
                     }
                     let bw = if it.label.is_empty() { 26 } else { 26 + it.label.len() as i32 * 6 };
@@ -638,6 +656,16 @@ unsafe fn paint(hwnd: HWND) {
     }
 
     // --- buttons ---
+    // combos live on the Home tab only — hide them on every other tab
+    let home_active = s.active == 0;
+    let fc = s.font_combo.get();
+    if !fc.0.is_null() {
+        let _ = ShowWindow(fc, if home_active { SW_SHOW } else { SW_HIDE });
+    }
+    let sc = s.size_combo.get();
+    if !sc.0.is_null() {
+        let _ = ShowWindow(sc, if home_active { SW_SHOW } else { SW_HIDE });
+    }
     let spots = s.spots.clone_rects();
     for (i, sp) in spots.iter().enumerate() {
         let it = &s.tabs[sp.tab].groups[sp.group].items[sp.item];
@@ -650,13 +678,15 @@ unsafe fn paint(hwnd: HWND) {
                     None => HWND::default(),
                 };
                 if !cb.0.is_null() {
+                    // a combobox's window height IS its dropped-list height —
+                    // sizing it to the spot (~23px) leaves no room for the list.
                     let _ = SetWindowPos(
                         cb,
                         HWND_TOP,
                         sp.rect.left,
                         sp.rect.top,
                         sp.rect.right - sp.rect.left,
-                        sp.rect.bottom - sp.rect.top,
+                        300,
                         SWP_NOACTIVATE,
                     );
                 }

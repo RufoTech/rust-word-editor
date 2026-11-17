@@ -150,8 +150,9 @@ fn run_xml(r: &RunFmt, text: &str, out: &mut String) {
     if r.pos_pt != 0.0 {
         let _ = write!(rp, "<w:position w:val=\"{}\"/>", pt_to_hp(r.pos_pt));
     }
-    if r.back != 0 && r.back != -1 {
-        let _ = write!(rp, "<w:highlight w:val=\"yellow\"/><w:shd w:val=\"clear\" w:fill=\"{}\"/>", hex(r.back));
+    // back < 0 means tomAutoColor (-9999997) — no highlight
+    if r.back > 0 {
+        let _ = write!(rp, "<w:shd w:val=\"clear\" w:fill=\"{}\"/>", hex(r.back));
     }
     out.push_str("<w:r>");
     if !rp.is_empty() {
@@ -227,7 +228,8 @@ fn document_xml(editor: HWND, page: &PageSetup, shapes: &[HWND]) -> String {
                         let next = match &r0 {
                             Some(rr) => {
                                 let _ = rr.MoveEnd(editor::TOM_CHARFMT, 1);
-                                rr.GetEnd().unwrap_or(para_end)
+                                // charfmt units may extend past the paragraph mark — clamp
+                                rr.GetEnd().unwrap_or(para_end).min(para_end)
                             }
                             None => para_end,
                         };
@@ -309,24 +311,27 @@ fn document_xml(editor: HWND, page: &PageSetup, shapes: &[HWND]) -> String {
         }
     }
 
+    // NOTE: a `\` continuation in a Rust string literal strips the newline AND
+    // all leading whitespace of the next line — each segment must therefore end
+    // with an explicit space before the `\`.
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<w:document xmlns:wpc=\"http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas\"\
- xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"\
- xmlns:o=\"urn:schemas-microsoft-com:office:office\"\
- xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"\
- xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\"\
- xmlns:v=\"urn:schemas-microsoft-com:vml\"\
- xmlns:wp14=\"http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing\"\
- xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"\
- xmlns:w10=\"urn:schemas-microsoft-com:office:word\"\
- xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"\
- xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\"\
- xmlns:wpg=\"http://schemas.microsoft.com/office/word/2010/wordprocessingGroup\"\
- xmlns:wpi=\"http://schemas.microsoft.com/office/word/2010/wordprocessingInk\"\
- xmlns:wne=\"http://schemas.microsoft.com/office/word/2006/wordml\"\
- xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"\
- mc:Ignorable=\"w14 wp14\">\
+<w:document xmlns:wpc=\"http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas\" \
+xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
+xmlns:o=\"urn:schemas-microsoft-com:office:office\" \
+xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
+xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\" \
+xmlns:v=\"urn:schemas-microsoft-com:vml\" \
+xmlns:wp14=\"http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing\" \
+xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
+xmlns:w10=\"urn:schemas-microsoft-com:office:word\" \
+xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" \
+xmlns:wpg=\"http://schemas.microsoft.com/office/word/2010/wordprocessingGroup\" \
+xmlns:wpi=\"http://schemas.microsoft.com/office/word/2010/wordprocessingInk\" \
+xmlns:wne=\"http://schemas.microsoft.com/office/word/2006/wordml\" \
+xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\" \
+mc:Ignorable=\"w14 wp14\">\
 <w:body>{body}\
 <w:sectPr>\
 <w:pgSz w:w=\"{pw}\" w:h=\"{ph}\"{orient}/>\

@@ -29,13 +29,14 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::{SetWindowSubclass, DefSubclassProc, RemoveWindowSubclass};
+use windows::Win32::System::DataExchange::*;
+use windows::Win32::System::Ole::CF_BITMAP;
 
 const MK_LBUTTON_FLAG: u32 = 0x0001;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const MAIN_CLASS: PCWSTR = w!("RWE_Main");
-const OVERLAY_CLASS: PCWSTR = w!("RWE_DrawOverlay");
-const KEY_COLOR: COLORREF = COLORREF(0x00FF00FF);
 
 // page sizes in twips
 const A4_W: i32 = 11906;
@@ -76,7 +77,6 @@ pub struct App {
     pub editor: HWND,
     pub status: HWND,
     pub backstage: HWND,
-    pub overlay: HWND,
     pub hinst: HINSTANCE,
     pub page: PageSetup,
     pub zoom_pct: i32,
@@ -84,6 +84,7 @@ pub struct App {
     pub focus_edit: HWND,       // editor hwnd that last had focus
     pub selected_shape: Option<HWND>,
     pub draw_mode: bool,
+    pub drawing: bool,
     pub draw_kind: ShapeKind,
     pub draw_start: POINT,
     pub draw_cur: POINT,
@@ -115,16 +116,6 @@ pub fn register(hinst: HINSTANCE) {
         };
         RegisterClassW(&wc);
 
-        let oc = WNDCLASSW {
-            style: WNDCLASS_STYLES(CS_HREDRAW.0 | CS_VREDRAW.0),
-            lpfnWndProc: Some(overlay_wndproc),
-            hInstance: hinst,
-            hCursor: LoadCursorW(None, IDC_CROSS).unwrap_or_default(),
-            hbrBackground: HBRUSH(GetStockObject(HOLLOW_BRUSH).0),
-            lpszClassName: OVERLAY_CLASS,
-            ..Default::default()
-        };
-        RegisterClassW(&oc);
     }
 }
 
@@ -151,7 +142,6 @@ pub fn run(hinst: HINSTANCE) -> windows::core::Result<()> {
             editor: HWND::default(),
             status: HWND::default(),
             backstage: HWND::default(),
-            overlay: HWND::default(),
             hinst,
             page: PageSetup::default(),
             zoom_pct: 100,
@@ -159,6 +149,7 @@ pub fn run(hinst: HINSTANCE) -> windows::core::Result<()> {
             focus_edit: HWND::default(),
             selected_shape: None,
             draw_mode: false,
+            drawing: false,
             draw_kind: ShapeKind::Rectangle,
             draw_start: POINT::default(),
             draw_cur: POINT::default(),
@@ -231,11 +222,14 @@ fn page_content_rect(client_w: i32, client_h: i32, page: &PageSetup, zoom: i32) 
     let mr = tw_to_px(page.mr_tw, zoom);
     let mb = tw_to_px(page.mb_tw, zoom);
     let x0 = (client_w - pw).max(0) / 2 + ml;
+    // the page top starts below the ribbon — without the offset the first
+    // line of the document renders underneath it and looks clipped
+    let page_top = ribbon::TOTAL_H + 8;
     RECT {
         left: x0,
-        top: mt + 8,
+        top: page_top + mt,
         right: x0 + pw - ml - mr,
-        bottom: mt + 8 + ph - mt - mb,
+        bottom: page_top + ph - mb,
     }
 }
 
@@ -243,7 +237,8 @@ fn page_rect(client_w: i32, _h: i32, page: &PageSetup, zoom: i32) -> RECT {
     let pw = tw_to_px(page.w_tw, zoom);
     let ph = tw_to_px(page.h_tw, zoom);
     let x0 = (client_w - pw).max(0) / 2;
-    RECT { left: x0, top: 8, right: x0 + pw, bottom: 8 + ph }
+    let page_top = ribbon::TOTAL_H + 8;
+    RECT { left: x0, top: page_top, right: x0 + pw, bottom: page_top + ph }
 }
 
 pub fn layout(hwnd: HWND) {
@@ -270,6 +265,9 @@ pub fn layout(hwnd: HWND) {
         );
         if a.backstage_on {
             let _ = SetWindowPos(a.backstage, HWND_TOP, 0, 0, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+            // first show leaves stale ribbon/document pixels — force a full repaint
+            let _ = InvalidateRect(a.backstage, None, TRUE);
+            let _ = UpdateWindow(a.backstage);
         } else {
             let _ = ShowWindow(a.backstage, SW_HIDE);
         }
@@ -741,9 +739,8 @@ fn do_command(id: u32, anchor: RECT) {
                 }
             }
             IDM_TEXT_BOX => {
-                a.draw_mode = true;
                 a.draw_kind = ShapeKind::TextBox;
-                show_overlay(a.hwnd);
+                begin_shape_draw();
             }
             IDM_DATE_TIME => {
                 if let Some(d) = focus_doc() {
@@ -780,7 +777,10 @@ fn do_command(id: u32, anchor: RECT) {
             IDM_FONT_DIALOG => {
                 open_font_dialog(a.hwnd);
             }
-            IDM_PICTURE | IDM_TABLE | IDM_HYPERLINK | IDM_SORT | IDM_COLUMNS | IDM_CHANGE_CASE => {
+            IDM_PICTURE => {
+                insert_picture(a.hwnd);
+            }
+            IDM_TABLE | IDM_HYPERLINK | IDM_SORT | IDM_COLUMNS | IDM_CHANGE_CASE => {
                 // reserved
             }
             _ => {}
@@ -1096,91 +1096,58 @@ fn fmt1(v: f32) -> String {
     }
 }
 
-// ---------- overlay (shape draw mode) ----------
+// ---------- shape draw mode ----------
+// A layered/color-key overlay lets clicks fall through to the editor (Win32
+// hit-tests only non-keyed pixels), so draw mode subclasses the editor itself
+// and paints the rubber band with XOR on its DC.
 
-fn show_overlay(parent: HWND) {
+const DRAW_SUBID: usize = 77;
+
+fn begin_shape_draw() {
     unsafe {
         let a = app();
-        if a.overlay.0.is_null() {
-            let ov = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-                OVERLAY_CLASS,
-                PCWSTR::null(),
-                WS_CHILD | WS_VISIBLE,
-                0,
-                ribbon::TOTAL_H,
-                10,
-                10,
-                parent,
-                HMENU::default(),
-                a.hinst,
-                None,
-            )
-            .unwrap_or_default();
-            let _ = SetLayeredWindowAttributes(ov, KEY_COLOR, 0, LWA_COLORKEY);
-            a.overlay = ov;
-        }
-        let mut rc = RECT::default();
-        let _ = GetClientRect(parent, &mut rc);
-        let _ = SetWindowPos(
-            a.overlay,
-            HWND_TOP,
-            0,
-            ribbon::TOTAL_H,
-            rc.right - rc.left,
-            rc.bottom - rc.top - ribbon::TOTAL_H - statusbar::STATUS_H,
-            SWP_SHOWWINDOW | SWP_NOACTIVATE,
-        );
-        let _ = ShowWindow(a.overlay, SW_SHOW);
-        let _ = SetCapture(a.overlay);
+        a.draw_mode = true;
+        a.drawing = false;
+        let _ = SetWindowSubclass(a.editor, Some(draw_subproc), DRAW_SUBID, 0);
+        let _ = SetCursor(LoadCursorW(None, IDC_CROSS).unwrap_or_default());
     }
 }
 
-fn hide_overlay() {
-    unsafe {
-        let a = app();
-        a.draw_mode = false;
-        if !a.overlay.0.is_null() {
-            let _ = ShowWindow(a.overlay, SW_HIDE);
-        }
-        let _ = ReleaseCapture();
+fn norm_rect(s: POINT, c: POINT) -> RECT {
+    RECT {
+        left: s.x.min(c.x),
+        top: s.y.min(c.y),
+        right: s.x.max(c.x),
+        bottom: s.y.max(c.y),
     }
 }
 
-unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+fn draw_band(target: HWND, r: &RECT) {
+    unsafe {
+        let dc = GetDC(target);
+        SetROP2(dc, R2_NOTXORPEN);
+        let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FFFFFF));
+        let old = SelectObject(dc, pen);
+        let _ = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        let _ = Rectangle(dc, r.left, r.top, r.right, r.bottom);
+        SelectObject(dc, old);
+        let _ = DeleteObject(pen);
+        let _ = ReleaseDC(target, dc);
+    }
+}
+
+unsafe extern "system" fn draw_subproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
     match msg {
-        WM_PAINT => {
-            let a = app();
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            let mut rc = RECT::default();
-            let _ = GetClientRect(hwnd, &mut rc);
-            // fill key color (fully transparent) then draw band
-            let kb = CreateSolidBrush(KEY_COLOR);
-            FillRect(hdc, &rc, kb);
-            let _ = DeleteObject(kb);
-            if a.draw_mode {
-                let s = a.draw_start;
-                let c = a.draw_cur;
-                let r = RECT {
-                    left: s.x.min(c.x),
-                    top: s.y.min(c.y),
-                    right: s.x.max(c.x),
-                    bottom: s.y.max(c.y),
-                };
-                let pen = CreatePen(PS_DASH, 1, ACCENT);
-                let old = SelectObject(hdc, pen);
-                let _ = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-                SelectObject(hdc, old);
-                let _ = DeleteObject(pen);
-            }
-            let _ = EndPaint(hwnd, &ps);
-            LRESULT(0)
-        }
-        WM_ERASEBKGND => LRESULT(0),
         WM_LBUTTONDOWN => {
             let a = app();
+            a.drawing = true;
             a.draw_start = POINT { x: loword_signed(lp.0 as isize), y: hiword_signed(lp.0 as isize) };
             a.draw_cur = a.draw_start;
             let _ = SetCapture(hwnd);
@@ -1188,44 +1155,44 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
         }
         WM_MOUSEMOVE => {
             let a = app();
-            if wp.0 & MK_LBUTTON_FLAG as usize != 0 {
+            if a.drawing {
+                let old = norm_rect(a.draw_start, a.draw_cur);
+                draw_band(hwnd, &old); // erase (XOR)
                 a.draw_cur = POINT { x: loword_signed(lp.0 as isize), y: hiword_signed(lp.0 as isize) };
-                let _ = InvalidateRect(hwnd, None, FALSE);
+                let new = norm_rect(a.draw_start, a.draw_cur);
+                draw_band(hwnd, &new); // draw
             }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             let a = app();
-            let s = a.draw_start;
-            let c = a.draw_cur;
-            let mut r = RECT {
-                left: s.x.min(c.x),
-                top: s.y.min(c.y),
-                right: s.x.max(c.x),
-                bottom: s.y.max(c.y),
-            };
-            if r.right - r.left < 8 || r.bottom - r.top < 8 {
-                r.right = r.left + 200;
-                r.bottom = r.top + 80;
+            if a.drawing {
+                let old = norm_rect(a.draw_start, a.draw_cur);
+                draw_band(hwnd, &old); // erase
+                a.drawing = false;
+                a.draw_mode = false;
+                let _ = ReleaseCapture();
+                let _ = RemoveWindowSubclass(hwnd, Some(draw_subproc), DRAW_SUBID);
+                // editor client coords -> main window client coords
+                let mut pts = [a.draw_start, a.draw_cur];
+                let _ = MapWindowPoints(hwnd, a.hwnd, &mut pts);
+                let mut r = norm_rect(pts[0], pts[1]);
+                if r.right - r.left < 8 || r.bottom - r.top < 8 {
+                    r.right = r.left + 220;
+                    r.bottom = r.top + 90;
+                }
+                let sh = shape::create(a.hwnd, a.hinst, a.draw_kind, r, a.zoom_pct);
+                a.shapes.push(sh);
+                select_shape(Some(sh));
             }
-            // overlay coords == main client coords shifted by ribbon height
-            r.top += ribbon::TAB_STRIP_H + (ribbon::TOTAL_H - ribbon::TAB_STRIP_H);
-            let _ = r;
-            hide_overlay();
-            // create shape (coords: overlay origin is at y=ribbon::TOTAL_H in client space)
-            let mut sr = RECT { left: s.x.min(c.x), top: s.y.min(c.y) + ribbon::TOTAL_H, right: s.x.max(c.x), bottom: s.y.max(c.y) + ribbon::TOTAL_H };
-            if sr.right - sr.left < 8 || sr.bottom - sr.top < 8 {
-                sr.right = sr.left + 220;
-                sr.bottom = sr.top + 90;
-            }
-            let sh = shape::create(a.hwnd, a.hinst, a.draw_kind, sr, a.zoom_pct);
-            a.shapes.push(sh);
-            select_shape(Some(sh));
             LRESULT(0)
         }
         WM_KEYDOWN => {
             if wp.0 == VK_ESCAPE.0 as usize {
-                hide_overlay();
+                let a = app();
+                a.drawing = false;
+                a.draw_mode = false;
+                let _ = RemoveWindowSubclass(hwnd, Some(draw_subproc), DRAW_SUBID);
             }
             LRESULT(0)
         }
@@ -1233,7 +1200,52 @@ unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             let _ = SetCursor(LoadCursorW(None, IDC_CROSS).unwrap_or_default());
             LRESULT(1)
         }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(draw_subproc), DRAW_SUBID);
+            DefSubclassProc(hwnd, msg, wp, lp)
+        }
+        _ => DefSubclassProc(hwnd, msg, wp, lp),
+    }
+}
+
+// ---------- picture insertion ----------
+
+fn insert_picture(owner: HWND) {
+    unsafe {
+        let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL).unwrap();
+        let filter = [
+            COMDLG_FILTERSPEC { pszName: w!("Bitmap Images"), pszSpec: w!("*.bmp") },
+            COMDLG_FILTERSPEC { pszName: w!("All Files"), pszSpec: w!("*.*") },
+        ];
+        let _ = dlg.SetFileTypes(&filter);
+        if dlg.Show(owner).is_err() {
+            return;
+        }
+        let Ok(item) = dlg.GetResult() else { return };
+        let Ok(p) = item.GetDisplayName(SIGDN_FILESYSPATH) else { return };
+        let path = p.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(p.0 as *const _));
+        if !path.to_lowercase().ends_with(".bmp") {
+            MessageBoxW(owner, w!("Only .bmp images are supported for now."), w!("Rust Word"), MB_ICONINFORMATION);
+            return;
+        }
+        let wpath = to_w(&path);
+        let hb = match LoadImageW(None, PCWSTR(wpath.as_ptr()), IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE) {
+            Ok(h) => h,
+            Err(_) => {
+                MessageBoxW(owner, w!("Could not load the image."), w!("Rust Word"), MB_ICONERROR);
+                return;
+            }
+        };
+        // RichEdit can't take an HBITMAP directly — put it on the clipboard and paste
+        if OpenClipboard(owner).is_ok() {
+            let _ = EmptyClipboard();
+            let _ = SetClipboardData(CF_BITMAP.0 as u32, hb);
+            let _ = CloseClipboard();
+            SendMessageW(app().focus_edit, WM_PASTE, WPARAM(0), LPARAM(0));
+        } else {
+            MessageBoxW(owner, w!("Clipboard unavailable."), w!("Rust Word"), MB_ICONERROR);
+        }
     }
 }
 
@@ -1474,7 +1486,7 @@ fn on_dropdown_pick(tag: u32, payload: i64) {
                 set_para_border(payload as u16);
             }
             IDM_SHAPES => {
-                let kind = match payload {
+                a.draw_kind = match payload {
                     1 => ShapeKind::Rectangle,
                     2 => ShapeKind::RoundedRect,
                     3 => ShapeKind::Ellipse,
@@ -1483,9 +1495,7 @@ fn on_dropdown_pick(tag: u32, payload: i64) {
                     6 => ShapeKind::Line,
                     _ => ShapeKind::TextBox,
                 };
-                a.draw_mode = true;
-                a.draw_kind = kind;
-                show_overlay(a.hwnd);
+                begin_shape_draw();
             }
             IDM_MARGINS => {
                 let (m, mt, mr, mb) = match payload {
