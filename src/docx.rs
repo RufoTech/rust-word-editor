@@ -4,16 +4,19 @@
 //! Write: same subset + shapes as wps text boxes.
 
 use crate::app::PageSetup;
+use crate::dropdown::ShapeKind;
 use crate::editor::{self, tom_document};
+use crate::shape::ShapeProps;
+use crate::theme::rgb;
 use crate::util::{pt_to_hp, pt_to_twips, twips_to_pt};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use windows::core::BSTR;
-use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
-use windows::Win32::Foundation::HWND;
+
 use windows::Win32::UI::Controls::RichEdit::*;
 
 // ---------- XML helpers ----------
@@ -28,6 +31,11 @@ fn esc(s: &str, out: &mut String) {
             _ => out.push(c),
         }
     }
+}
+
+/// docx stores RRGGBB; COLORREF is BGR-packed — swap the channels.
+fn docx_rgb_to_colorref(c: u32) -> COLORREF {
+    COLORREF((c & 0xFF) << 16 | (c & 0xFF00) | ((c >> 16) & 0xFF))
 }
 
 fn hex(color: i32) -> String {
@@ -289,7 +297,7 @@ fn document_xml(editor: HWND, page: &PageSetup, shapes: &[HWND]) -> String {
 <a:prstGeom prst=\"{geom}\"><a:avLst/></a:prstGeom>{fill}</wps:spPr>\
 <wps:txbx><w:txbxContent><w:p><w:r><w:t xml:space=\"preserve\">{txt}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
 <wps:bodyPr lIns=\"{li}\" tIns=\"{ti}\" rIns=\"{ri}\" bIns=\"{bi}\"/></wps:wsp>\
-</a:graphicData></a:graphic></wp:anchor></w:r></w:p>",
+</a:graphicData></a:graphic></wp:anchor></w:drawing></w:r></w:p>",
                 z = 251659264 + i,
                 x = wr.left as i64 * 914400 / 96,
                 y = wr.top as i64 * 914400 / 96,
@@ -639,6 +647,32 @@ fn parse_ppr(e: &BytesStart, p: &mut ParaFmt) {
     }
 }
 
+/// Shapes / page setup read back from a .docx — taken by the app after load.
+pub struct PendingShape {
+    pub props: ShapeProps,
+    pub rect: RECT,
+    pub text: String,
+}
+
+static mut PENDING_SHAPES: Vec<PendingShape> = Vec::new();
+static mut PENDING_PAGE: Option<PageSetup> = None;
+
+pub fn take_pending_shapes() -> Vec<PendingShape> {
+    unsafe { std::mem::take(&mut *(&raw mut PENDING_SHAPES)) }
+}
+
+pub fn take_pending_page() -> Option<PageSetup> {
+    unsafe { (&raw mut PENDING_PAGE).replace(None) }
+}
+
+struct ShapeAcc {
+    props: ShapeProps,
+    rect: RECT,
+    text: String,
+    in_txbx: bool,
+    para_marks: usize,
+}
+
 /// Load a .docx / .txt into the editor.
 pub fn load(path: &str, editor: HWND) -> Result<(), String> {
     let lower = path.to_lowercase();
@@ -673,6 +707,11 @@ pub fn load(path: &str, editor: HWND) -> Result<(), String> {
     }
     let mut ctx = Ctx { doc, end: 0 };
 
+    unsafe {
+        PENDING_SHAPES.clear();
+        PENDING_PAGE = None;
+    }
+
     let mut reader = Reader::from_str(&xml);
     let mut rf = RunFmt::default();
     let mut pf = ParaFmt::default();
@@ -683,11 +722,91 @@ pub fn load(path: &str, editor: HWND) -> Result<(), String> {
     let mut in_t = false;
     let mut in_rpr = false;
     let mut in_ppr = false;
+    // <w:drawing> state — shapes and their inner text are collected into
+    // pending shapes instead of the body
+    let mut in_drawing = false;
+    let mut shape: Option<ShapeAcc> = None;
+    let mut pos_dim = 0u8; // which posOffset we're on: 0=H, 1=V
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                match e.local_name().as_ref() {
+                let ln = e.local_name();
+                let lnb = ln.as_ref();
+                // --- inside a <w:drawing> ---
+                if in_drawing {
+                    match lnb {
+                        b"txbxContent" => {
+                            if let Some(s) = shape.as_mut() {
+                                s.in_txbx = true;
+                            }
+                        }
+                        b"positionH" => pos_dim = 0,
+                        b"positionV" => pos_dim = 1,
+                        b"extent" => {
+                            let (mut cx, mut cy) = (0i64, 0i64);
+                            for a in e.attributes().flatten() {
+                                match a.key.as_ref() {
+                                    b"cx" => cx = String::from_utf8_lossy(&a.value).parse().unwrap_or(0),
+                                    b"cy" => cy = String::from_utf8_lossy(&a.value).parse().unwrap_or(0),
+                                    _ => {}
+                                }
+                            }
+                            if let Some(s) = shape.as_mut() {
+                                s.rect.right = s.rect.left + (cx * 96 / 914400) as i32;
+                                s.rect.bottom = s.rect.top + (cy * 96 / 914400) as i32;
+                            }
+                        }
+                        b"prstGeom" => {
+                            for a in e.attributes().flatten() {
+                                if a.key.as_ref() == b"prst" {
+                                    if let Some(s) = shape.as_mut() {
+                                        s.props.kind = match a.value.as_ref() {
+                                            b"roundRect" => ShapeKind::RoundedRect,
+                                            b"ellipse" => ShapeKind::Ellipse,
+                                            b"rightArrow" => ShapeKind::RightArrow,
+                                            b"downArrow" => ShapeKind::DownArrow,
+                                            _ => ShapeKind::Rectangle,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        b"bodyPr" => {
+                            if let Some(s) = shape.as_mut() {
+                                for a in e.attributes().flatten() {
+                                    let v: i64 = String::from_utf8_lossy(&a.value).parse().unwrap_or(0);
+                                    let px = (v * 96 / 914400) as i32;
+                                    match a.key.as_ref() {
+                                        b"lIns" => s.props.inset_l = px,
+                                        b"tIns" => s.props.inset_t = px,
+                                        b"rIns" => s.props.inset_r = px,
+                                        b"bIns" => s.props.inset_b = px,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        b"solidFill" | b"srgbClr" => {
+                            for a in e.attributes().flatten() {
+                                if a.key.as_ref() == b"val" {
+                                    if let Some(s) = shape.as_mut() {
+                                        if let Ok(rgb) = u32::from_str_radix(
+                                            &String::from_utf8_lossy(&a.value),
+                                            16,
+                                        ) {
+                                            s.props.fill = docx_rgb_to_colorref(rgb);
+                                            s.props.has_fill = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                match lnb {
                     b"p" => {
                         in_p = true;
                         pf = ParaFmt::default();
@@ -701,6 +820,19 @@ pub fn load(path: &str, editor: HWND) -> Result<(), String> {
                     }
                     b"rPr" if in_run => in_rpr = true,
                     b"t" => in_t = true,
+                    b"drawing" => {
+                        in_drawing = true;
+                        let mut pr = ShapeProps::default();
+                        pr.has_outline = true;
+                        pr.outline = rgb(0x44, 0x72, 0xC4);
+                        shape = Some(ShapeAcc {
+                            props: pr,
+                            rect: RECT::default(),
+                            text: String::new(),
+                            in_txbx: false,
+                            para_marks: 0,
+                        });
+                    }
                     b"br" | b"cr" => {
                         ctx.insert("\n");
                     }
@@ -717,30 +849,175 @@ pub fn load(path: &str, editor: HWND) -> Result<(), String> {
                 }
             }
             Ok(Event::Empty(e)) => {
-                if in_rpr {
-                    parse_rpr(&e, &mut rf);
-                } else if in_ppr {
-                    parse_ppr(&e, &mut pf);
-                } else {
-                    match e.local_name().as_ref() {
-                        b"br" | b"cr" => {
-                            ctx.insert("\n");
+                let lnb = e.local_name();
+                let lnb = lnb.as_ref();
+                if in_drawing {
+                    match lnb {
+                        b"extent" => {
+                            let (mut cx, mut cy) = (0i64, 0i64);
+                            for a in e.attributes().flatten() {
+                                match a.key.as_ref() {
+                                    b"cx" => cx = String::from_utf8_lossy(&a.value).parse().unwrap_or(0),
+                                    b"cy" => cy = String::from_utf8_lossy(&a.value).parse().unwrap_or(0),
+                                    _ => {}
+                                }
+                            }
+                            if let Some(s) = shape.as_mut() {
+                                s.rect.right = s.rect.left + (cx * 96 / 914400) as i32;
+                                s.rect.bottom = s.rect.top + (cy * 96 / 914400) as i32;
+                            }
                         }
-                        b"tab" => {
-                            ctx.insert("\t");
+                        b"prstGeom" => {
+                            for a in e.attributes().flatten() {
+                                if a.key.as_ref() == b"prst" {
+                                    if let Some(s) = shape.as_mut() {
+                                        s.props.kind = match a.value.as_ref() {
+                                            b"roundRect" => ShapeKind::RoundedRect,
+                                            b"ellipse" => ShapeKind::Ellipse,
+                                            b"rightArrow" => ShapeKind::RightArrow,
+                                            b"downArrow" => ShapeKind::DownArrow,
+                                            _ => ShapeKind::Rectangle,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        b"bodyPr" => {
+                            if let Some(s) = shape.as_mut() {
+                                for a in e.attributes().flatten() {
+                                    let v: i64 = String::from_utf8_lossy(&a.value).parse().unwrap_or(0);
+                                    let px = (v * 96 / 914400) as i32;
+                                    match a.key.as_ref() {
+                                        b"lIns" => s.props.inset_l = px,
+                                        b"tIns" => s.props.inset_t = px,
+                                        b"rIns" => s.props.inset_r = px,
+                                        b"bIns" => s.props.inset_b = px,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        b"srgbClr" => {
+                            for a in e.attributes().flatten() {
+                                if a.key.as_ref() == b"val" {
+                                    if let Some(s) = shape.as_mut() {
+                                        if let Ok(rgb) = u32::from_str_radix(
+                                            &String::from_utf8_lossy(&a.value),
+                                            16,
+                                        ) {
+                                            s.props.fill = docx_rgb_to_colorref(rgb);
+                                            s.props.has_fill = true;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         _ => {}
+                    }
+                    continue;
+                }
+                match lnb {
+                    b"pgSz" => {
+                        let mut ps = PageSetup::default();
+                        for a in e.attributes().flatten() {
+                            let v: i32 = String::from_utf8_lossy(&a.value).parse().unwrap_or(0);
+                            match a.key.as_ref() {
+                                b"w" => ps.w_tw = v,
+                                b"h" => ps.h_tw = v,
+                                b"orient" => ps.landscape = a.value.as_ref() == b"landscape",
+                                _ => {}
+                            }
+                        }
+                        unsafe { PENDING_PAGE = Some(ps) };
+                    }
+                    b"pgMar" => {
+                        let mut ps = unsafe { PENDING_PAGE.take().unwrap_or_default() };
+                        for a in e.attributes().flatten() {
+                            let v: i32 = String::from_utf8_lossy(&a.value).parse().unwrap_or(0);
+                            match a.key.as_ref() {
+                                b"top" => ps.mt_tw = v,
+                                b"right" => ps.mr_tw = v,
+                                b"bottom" => ps.mb_tw = v,
+                                b"left" => ps.ml_tw = v,
+                                _ => {}
+                            }
+                        }
+                        unsafe { PENDING_PAGE = Some(ps) };
+                    }
+                    b"br" | b"cr" => {
+                        ctx.insert("\n");
+                    }
+                    b"tab" => {
+                        ctx.insert("\t");
+                    }
+                    _ => {
+                        if in_rpr {
+                            parse_rpr(&e, &mut rf);
+                        } else if in_ppr {
+                            parse_ppr(&e, &mut pf);
+                        }
                     }
                 }
             }
             Ok(Event::Text(e)) => {
+                if in_drawing {
+                    // posOffset values and txbxContent text arrive as Text events
+                    let t = e.unescape().unwrap_or_default().to_string();
+                    if let Some(s) = shape.as_mut() {
+                        if s.in_txbx {
+                            s.text.push_str(&t);
+                        } else if let Ok(v) = t.trim().parse::<i64>() {
+                            let px = (v * 96 / 914400) as i32;
+                            if pos_dim == 0 {
+                                s.rect.left = px;
+                            } else {
+                                s.rect.top = px;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if in_t && in_run {
                     let t = e.unescape().unwrap_or_default().to_string();
                     ctx.insert(&t);
                 }
             }
             Ok(Event::End(e)) => {
-                match e.local_name().as_ref() {
+                let lnb = e.local_name();
+                match lnb.as_ref() {
+                    b"txbxContent" => {
+                        if let Some(s) = shape.as_mut() {
+                            s.in_txbx = false;
+                        }
+                        continue;
+                    }
+                    b"drawing" => {
+                        in_drawing = false;
+                        if let Some(s) = shape.take() {
+                            if s.rect.right - s.rect.left < 8 {
+                                let mut s = s;
+                                s.rect.right = s.rect.left + 220;
+                                s.rect.bottom = s.rect.top + 90;
+                                unsafe { PENDING_SHAPES.push(PendingShape { props: s.props, rect: s.rect, text: s.text }) };
+                            } else {
+                                unsafe { PENDING_SHAPES.push(PendingShape { props: s.props, rect: s.rect, text: s.text }) };
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if in_drawing {
+                    // text inside txbxContent: paragraph marks become \r in the shape
+                    if let Some(s) = shape.as_mut() {
+                        if s.in_txbx && lnb.as_ref() == b"p" {
+                            s.text.push('\r');
+                            s.para_marks += 1;
+                        }
+                    }
+                    continue;
+                }
+                match lnb.as_ref() {
                     b"t" => in_t = false,
                     b"rPr" => in_rpr = false,
                     b"pPr" => in_ppr = false,

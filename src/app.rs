@@ -264,14 +264,59 @@ pub fn layout(hwnd: HWND) {
             SWP_NOACTIVATE,
         );
         if a.backstage_on {
+            // hiding the ribbon also hides its combo children — the only
+            // bulletproof way to keep them off the backstage surface
+            let _ = ShowWindow(a.ribbon, SW_HIDE);
+            let _ = ShowWindow(a.editor, SW_HIDE);
+            let _ = ShowWindow(a.status, SW_HIDE);
             let _ = SetWindowPos(a.backstage, HWND_TOP, 0, 0, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE);
-            // first show leaves stale ribbon/document pixels — force a full repaint
             let _ = InvalidateRect(a.backstage, None, TRUE);
             let _ = UpdateWindow(a.backstage);
         } else {
             let _ = ShowWindow(a.backstage, SW_HIDE);
+            let _ = ShowWindow(a.ribbon, SW_SHOW);
+            let _ = ShowWindow(a.editor, SW_SHOW);
+            let _ = ShowWindow(a.status, SW_SHOW);
         }
         let _ = InvalidateRect(hwnd, None, FALSE);
+    }
+}
+
+fn clear_shapes(a: &mut App) {
+    for sh in a.shapes.drain(..) {
+        unsafe {
+            let _ = DestroyWindow(sh);
+        }
+    }
+    a.selected_shape = None;
+    ribbon::set_shape_mode(a.ribbon, false);
+}
+
+/// Apply a font combo's current text — called directly by the ribbon on
+/// Enter / list commit, bypassing the WM_COMMAND notification chain.
+pub fn apply_combo(id: u32) {
+    {
+        let a = app();
+        match id {
+            IDC_FONT_NAME => {
+                let name = ribbon::combo_text(a.ribbon, IDC_FONT_NAME);
+                if !name.is_empty() {
+                    if let Some(d) = focus_doc() {
+                        format::set_font_name(&d, &name);
+                    }
+                }
+            }
+            IDC_FONT_SIZE => {
+                let s = ribbon::combo_text(a.ribbon, IDC_FONT_SIZE);
+                if let Some(v) = parse_f(&s) {
+                    if let Some(d) = focus_doc() {
+                        format::set_font_size(&d, v);
+                    }
+                }
+            }
+            _ => {}
+        }
+        sync_ribbon();
     }
 }
 
@@ -595,6 +640,7 @@ fn do_command(id: u32, anchor: RECT) {
                         let _ = r.SetText(&windows::core::BSTR::from(""));
                     }
                 }
+                clear_shapes(a);
                 a.file_path = None;
                 a.backstage_on = false;
                 layout(a.hwnd);
@@ -603,6 +649,21 @@ fn do_command(id: u32, anchor: RECT) {
                 if let Some(p) = pick_open_path(a.hwnd) {
                     match docx::load(&p, a.editor) {
                         Ok(()) => {
+                            clear_shapes(a);
+                            if let Some(ps) = docx::take_pending_page() {
+                                a.page = ps;
+                            }
+                            for ps in docx::take_pending_shapes() {
+                                let sh = shape::create_with_props(a.hwnd, a.hinst, ps.props, ps.rect, a.zoom_pct);
+                                if !ps.text.is_empty() {
+                                    if let Some(d) = tom_document(shape::inner_edit(sh)) {
+                                        if let Ok(r) = d.Range(0, 0) {
+                                            let _ = r.SetText(&windows::core::BSTR::from(ps.text.as_str()));
+                                        }
+                                    }
+                                }
+                                a.shapes.push(sh);
+                            }
                             a.file_path = Some(p.clone());
                             backstage::set_doc_name(a.backstage, &p);
                         }
@@ -1125,7 +1186,9 @@ fn norm_rect(s: POINT, c: POINT) -> RECT {
 fn draw_band(target: HWND, r: &RECT) {
     unsafe {
         let dc = GetDC(target);
-        SetROP2(dc, R2_NOTXORPEN);
+        // R2_XORPEN + white pen inverts the screen: black on the white page
+        // (R2_NOTXORPEN with white draws white on white — invisible)
+        SetROP2(dc, R2_XORPEN);
         let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FFFFFF));
         let old = SelectObject(dc, pen);
         let _ = SelectObject(dc, GetStockObject(NULL_BRUSH));

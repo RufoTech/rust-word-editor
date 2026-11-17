@@ -416,22 +416,8 @@ fn subclass_combo(cb: HWND, id: u32) {
         ) -> LRESULT {
             unsafe {
                 if msg == WM_KEYDOWN && wp.0 == VK_RETURN.0 as usize {
-                    // hwnd may be the inner EDIT control of the combobox —
-                    // climb to the combobox, then to the main window
-                    let mut p = GetParent(hwnd).unwrap_or_default(); // combobox or ribbon
-                    let mut grand = GetParent(p).unwrap_or_default(); // ribbon or main
-                    if grand.0.is_null() {
-                        grand = p;
-                        p = hwnd;
-                    }
-                    // when called on the edit child, `p` is the combobox and
-                    // its window text is the value the app should read
-                    SendMessageW(
-                        grand,
-                        WM_COMMAND,
-                        WPARAM(((CBN_SELCHANGE as usize) << 16) | data),
-                        LPARAM(p.0 as isize),
-                    );
+                    // apply the typed value directly — no fragile forwarding chain
+                    crate::app::apply_combo(data as u32);
                     return LRESULT(0);
                 }
                 DefSubclassProc(hwnd, msg, wp, lp)
@@ -439,12 +425,14 @@ fn subclass_combo(cb: HWND, id: u32) {
         }
         let _ = SetWindowSubclass(cb, Some(proc), NEXT_SUBCLASS, id as usize);
         NEXT_SUBCLASS += 1;
-        // keys typed into a CBS_DROPDOWN combo go to its inner EDIT child —
-        // subclass it too, with the same forwarding proc
-        let edit = GetWindow(cb, GW_CHILD).unwrap_or_default();
-        if !edit.0.is_null() {
-            let _ = SetWindowSubclass(edit, Some(proc), NEXT_SUBCLASS, id as usize);
+        // keys typed into a CBS_DROPDOWN combo go to its inner EDIT child.
+        // GetWindow(GW_CHILD) alone may return the hidden listbox, so walk
+        // every child of the combobox.
+        let mut child = GetWindow(cb, GW_CHILD).unwrap_or_default();
+        while !child.0.is_null() {
+            let _ = SetWindowSubclass(child, Some(proc), NEXT_SUBCLASS, id as usize);
             NEXT_SUBCLASS += 1;
+            child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
         }
     }
 }
@@ -902,7 +890,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_COMMAND => {
-            // combobox notifications land on the ribbon (their parent): forward to main
+            // combobox notifications land on the ribbon (their parent) —
+            // apply them directly instead of re-forwarding through WM_COMMAND
+            let code = (wp.0 >> 16) as u32;
+            let id = (wp.0 & 0xffff) as u32;
+            if (id == IDC_FONT_NAME || id == IDC_FONT_SIZE)
+                && (code == CBN_SELCHANGE || code == CBN_SELENDOK)
+            {
+                crate::app::apply_combo(id);
+                return LRESULT(0);
+            }
             let parent = GetParent(hwnd).unwrap_or_default();
             SendMessageW(parent, msg, wp, lp)
         }

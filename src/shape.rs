@@ -85,10 +85,20 @@ pub fn create(
     rect: RECT,
     zoom_pct: i32,
 ) -> HWND {
+    let mut props = ShapeProps::default();
+    props.kind = kind;
+    create_with_props(parent, hinst, props, rect, zoom_pct)
+}
+
+pub fn create_with_props(
+    parent: HWND,
+    hinst: HINSTANCE,
+    mut props: ShapeProps,
+    rect: RECT,
+    zoom_pct: i32,
+) -> HWND {
     unsafe {
-        let mut props = ShapeProps::default();
-        props.kind = kind;
-        match kind {
+        match props.kind {
             ShapeKind::TextBox => {
                 props.fill = PAGE_WHITE;
                 props.inset_l = pt_to_twips(7.2) / 20; // ≈ px at 96dpi
@@ -111,8 +121,11 @@ pub fn create(
             orig_rect: RECT::default(),
             zoom_pct,
         });
+        // no WS_EX_TRANSPARENT: a transparent window lets clicks fall
+        // through to the document, so the shape could never be focused,
+        // moved, resized, or typed into
         let hwnd = CreateWindowExW(
-            WS_EX_TRANSPARENT,
+            WINDOW_EX_STYLE(0),
             CLASS,
             PCWSTR::null(),
             WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
@@ -136,9 +149,61 @@ pub fn create(
             SendMessageW(edit, EM_SETMARGINS, WPARAM(EC_LEFTMARGIN as usize | EC_RIGHTMARGIN as usize), LPARAM(0));
             SendMessageW(edit, EM_SETTEXTMODE, WPARAM(TM_SINGLELEVELUNDO.0 as usize), LPARAM(0));
             (*s).edit = edit;
+            update_region(hwnd);
             layout_edit(hwnd);
         }
         hwnd
+    }
+}
+
+/// Clip the window (and its child editor) to the shape's geometry — keeps
+/// ellipse/arrow text inside the outline like Word does.
+unsafe fn update_region(hwnd: HWND) {
+    let s = state(hwnd);
+    if s.is_null() {
+        return;
+    }
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+    let rgn = match (*s).props.kind {
+        ShapeKind::Ellipse => CreateEllipticRgn(0, 0, w, h),
+        ShapeKind::RightArrow | ShapeKind::DownArrow => {
+            let cx = w / 2;
+            let cy = h / 2;
+            let pts = if (*s).props.kind == ShapeKind::RightArrow {
+                let sh = h / 2;
+                let q = sh / 2;
+                let head = (w / 4).max(8);
+                vec![
+                    POINT { x: 0, y: cy - q },
+                    POINT { x: w - head, y: cy - q },
+                    POINT { x: w - head, y: 0 },
+                    POINT { x: w, y: cy },
+                    POINT { x: w - head, y: h },
+                    POINT { x: w - head, y: cy + q },
+                    POINT { x: 0, y: cy + q },
+                ]
+            } else {
+                let q = w / 4;
+                let head = (h / 4).max(8);
+                vec![
+                    POINT { x: cx - q, y: 0 },
+                    POINT { x: cx + q, y: 0 },
+                    POINT { x: cx + q, y: h - head },
+                    POINT { x: w, y: h - head },
+                    POINT { x: cx, y: h },
+                    POINT { x: 0, y: h - head },
+                    POINT { x: cx - q, y: h - head },
+                ]
+            };
+            CreatePolygonRgn(&pts, ALTERNATE)
+        }
+        _ => HRGN::default(),
+    };
+    if !rgn.0.is_null() {
+        let _ = SetWindowRgn(hwnd, rgn, TRUE); // takes ownership
     }
 }
 
@@ -162,9 +227,18 @@ unsafe fn layout_edit(hwnd: HWND) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     let z = st.zoom_pct;
-    let l = 2 + scale(st.props.inset_l, z);
-    let t = 2 + scale(st.props.inset_t, z);
-    let r = (rc.right - rc.left) - 2 - scale(st.props.inset_r, z);
+    // keep the inner editor inside the visible geometry for curved shapes
+    let extra_x = match st.props.kind {
+        ShapeKind::Ellipse => (rc.right - rc.left) / 8,
+        _ => 0,
+    };
+    let extra_y = match st.props.kind {
+        ShapeKind::Ellipse => (rc.bottom - rc.top) / 8,
+        _ => 0,
+    };
+    let l = 2 + extra_x + scale(st.props.inset_l, z);
+    let t = 2 + extra_y + scale(st.props.inset_t, z);
+    let r = (rc.right - rc.left) - 2 - extra_x - scale(st.props.inset_r, z);
     let b = (rc.bottom - rc.top) - 2 - scale(st.props.inset_b, z);
     let _ = SetWindowPos(st.edit, HWND_TOP, l, t, (r - l).max(8), (b - t).max(8), SWP_NOACTIVATE);
 }
@@ -320,6 +394,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_SIZE => {
+            update_region(hwnd);
             layout_edit(hwnd);
             LRESULT(0)
         }
