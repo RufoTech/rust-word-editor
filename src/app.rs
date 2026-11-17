@@ -263,12 +263,20 @@ pub fn layout(hwnd: HWND) {
             er.bottom - er.top,
             SWP_NOACTIVATE,
         );
+        // HWND_TOP on the editor also puts it above every shape — raise the
+        // shapes back over it or they become unclickable after each layout
+        for &s in &a.shapes {
+            let _ = SetWindowPos(s, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
         if a.backstage_on {
             // hiding the ribbon also hides its combo children — the only
             // bulletproof way to keep them off the backstage surface
             let _ = ShowWindow(a.ribbon, SW_HIDE);
             let _ = ShowWindow(a.editor, SW_HIDE);
             let _ = ShowWindow(a.status, SW_HIDE);
+            for &s in &a.shapes {
+                let _ = ShowWindow(s, SW_HIDE);
+            }
             let _ = SetWindowPos(a.backstage, HWND_TOP, 0, 0, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE);
             let _ = InvalidateRect(a.backstage, None, TRUE);
             let _ = UpdateWindow(a.backstage);
@@ -277,6 +285,9 @@ pub fn layout(hwnd: HWND) {
             let _ = ShowWindow(a.ribbon, SW_SHOW);
             let _ = ShowWindow(a.editor, SW_SHOW);
             let _ = ShowWindow(a.status, SW_SHOW);
+            for &s in &a.shapes {
+                let _ = ShowWindow(s, SW_SHOW);
+            }
         }
         let _ = InvalidateRect(hwnd, None, FALSE);
     }

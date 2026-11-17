@@ -556,6 +556,19 @@ unsafe fn draw_text(hdc: HDC, s: &str, r: &mut RECT, fmt: DRAW_TEXT_FORMAT, colo
     DrawTextW(hdc, &mut buf[..n], r, fmt);
 }
 
+// Fluent-style rounded hover/checked fill (4px radius, no border)
+unsafe fn round_fill(hdc: HDC, r: &RECT, color: COLORREF) {
+    let b = CreateSolidBrush(color);
+    let p = CreatePen(PS_SOLID, 1, color);
+    let ob = SelectObject(hdc, b);
+    let op = SelectObject(hdc, p);
+    let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, 8, 8);
+    SelectObject(hdc, ob);
+    SelectObject(hdc, op);
+    let _ = DeleteObject(b);
+    let _ = DeleteObject(p);
+}
+
 unsafe fn paint(hwnd: HWND) {
     let s = &mut *state(hwnd);
     let mut ps = PAINTSTRUCT::default();
@@ -587,16 +600,26 @@ unsafe fn paint(hwnd: HWND) {
         } else {
             let t = &s.tabs[idx];
             if idx == s.active {
+                // Word 365: active tab is a white rounded-top tab
                 let ab = CreateSolidBrush(TAB_ACTIVE);
-                FillRect(hdc, &r, ab);
+                let ap = CreatePen(PS_SOLID, 1, TAB_ACTIVE);
+                let ob = SelectObject(hdc, ab);
+                let op = SelectObject(hdc, ap);
+                let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom + 8, 8, 8);
+                SelectObject(hdc, ob);
+                SelectObject(hdc, op);
                 let _ = DeleteObject(ab);
-            } else if t.contextual {
-                let cb = CreateSolidBrush(rgb(0xF8, 0xE5, 0xB0));
-                FillRect(hdc, &r, cb);
-                let _ = DeleteObject(cb);
+                let _ = DeleteObject(ap);
             }
             let mut tr = r;
-            draw_text(hdc, t.name, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE, if t.contextual { TAB_TEXT_HOT } else { TAB_TEXT });
+            let tc = if idx == s.active {
+                TAB_TEXT_ACTIVE
+            } else if t.contextual {
+                TAB_TEXT_HOT
+            } else {
+                TAB_TEXT
+            };
+            draw_text(hdc, t.name, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE, tc);
         }
     }
 
@@ -684,28 +707,16 @@ unsafe fn paint(hwnd: HWND) {
                 if sp.split {
                     // only dropdown arrow zone
                     if s.hot == i as isize || s.pressed == i as isize {
-                        let hb = CreateSolidBrush(BTN_HOT);
-                        FillRect(hdc, &sp.rect, hb);
-                        let _ = DeleteObject(hb);
+                        round_fill(hdc, &sp.rect, BTN_HOT);
                     }
                     let mut tr = sp.rect;
                     draw_text(hdc, "▾", &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE, BTN_TEXT);
                 } else {
                     let checked = it.toggle && is_checked(it.id, &s.st);
                     if checked {
-                        let cb = CreateSolidBrush(BTN_CHECKED);
-                        FillRect(hdc, &sp.rect, cb);
-                        let _ = DeleteObject(cb);
-                        let pb = CreateSolidBrush(BTN_CHECKED_BORDER);
-                        FrameRect(hdc, &sp.rect, pb);
-                        let _ = DeleteObject(pb);
+                        round_fill(hdc, &sp.rect, BTN_CHECKED);
                     } else if s.hot == i as isize || s.pressed == i as isize {
-                        let hb = CreateSolidBrush(BTN_HOT);
-                        FillRect(hdc, &sp.rect, hb);
-                        let _ = DeleteObject(hb);
-                        let pb = CreateSolidBrush(BTN_HOT_BORDER);
-                        FrameRect(hdc, &sp.rect, pb);
-                        let _ = DeleteObject(pb);
+                        round_fill(hdc, &sp.rect, BTN_HOT);
                     }
                     match it.style {
                         Style::Large => {

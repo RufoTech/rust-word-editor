@@ -152,6 +152,9 @@ pub fn create_with_props(
             update_region(hwnd);
             layout_edit(hwnd);
         }
+        // keep the shape above the editor sibling — layout() re-tops the
+        // editor every time it runs, and some hosts don't top a new child
+        let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         hwnd
     }
 }

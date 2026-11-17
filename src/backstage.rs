@@ -95,9 +95,9 @@ unsafe fn paint(hwnd: HWND) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
 
-    // left column
+    // left column — Word 365 backstage: deep blue nav, white items
     let col = RECT { left: 0, top: 0, right: 260, bottom: rc.bottom };
-    let b = CreateSolidBrush(rgb(0xF1, 0xF1, 0xF1));
+    let b = CreateSolidBrush(ACCENT);
     FillRect(hdc, &col, b);
     let _ = DeleteObject(b);
     // right side: white stays
@@ -110,20 +110,20 @@ unsafe fn paint(hwnd: HWND) {
     for (i, it) in ITEMS.iter().enumerate() {
         let r = item_rect(i);
         if s.hot == i as isize {
-            let hb = CreateSolidBrush(BTN_HOT);
+            let hb = CreateSolidBrush(rgb(0x2F, 0x6B, 0xCD)); // lighter blue hover on blue nav
             FillRect(hdc, &r, hb);
             let _ = DeleteObject(hb);
         }
         let mut tr = r;
         tr.left += 24;
-        SetTextColor(hdc, if i == 0 { ACCENT } else { BTN_TEXT });
+        SetTextColor(hdc, PAGE_WHITE);
         let mut buf = to_w(it.label);
         buf.pop();
         DrawTextW(hdc, &mut buf, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
     // doc title on right
     let mut tr = RECT { left: 300, top: 24, right: rc.right - 40, bottom: 60 };
-    SetTextColor(hdc, TAB_TEXT);
+    SetTextColor(hdc, BTN_TEXT);
     let mut buf = to_w(&s.doc_name);
     buf.pop();
     DrawTextW(hdc, &mut buf, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
