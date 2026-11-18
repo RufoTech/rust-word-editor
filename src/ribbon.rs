@@ -524,7 +524,7 @@ fn layout_body(s: &mut RibbonState, w: i32) {
                         row = if has_combo { 1 } else { 0 };
                         col_x += 30;
                     }
-                    let bw = if it.label.is_empty() { 26 } else { 26 + it.label.len() as i32 * 6 };
+                    let bw = if it.label.is_empty() { 26 } else { 26 + it.label.len() as i32 * 7 };
                     let mut r = RECT {
                         left: col_x,
                         top: body_top + 2 + row * 25,
