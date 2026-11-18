@@ -22,6 +22,26 @@ const GROUP_LABEL_H: i32 = 16;
 
 const CLASS: PCWSTR = w!("RWE_Ribbon");
 
+/// Word-like font list: these always lead the combo, system fonts follow.
+const COMMON_FONTS: &[&str] = &[
+    "Calibri",
+    "Arial",
+    "Times New Roman",
+    "Cambria",
+    "Georgia",
+    "Verdana",
+    "Tahoma",
+    "Segoe UI",
+    "Trebuchet MS",
+    "Consolas",
+    "Courier New",
+    "Impact",
+    "Comic Sans MS",
+    "Book Antiqua",
+    "Century Gothic",
+    "Garamond",
+];
+
 #[derive(Clone, Copy, PartialEq)]
 enum Style {
     Large, // full-height button, glyph over label
@@ -368,12 +388,21 @@ fn ensure_combos(hwnd: HWND, s: &RibbonState, hinst: HINSTANCE) {
             )
             .unwrap_or_default();
             s.font_combo.set(cb);
-            let mut fonts = Vec::new();
-            enum_fonts(&mut fonts);
-            for f in fonts {
-                let w = to_w(&f);
+            // Word-style list: the everyday families first, then every
+            // installed font, deduplicated.
+            let mut fonts: Vec<String> = COMMON_FONTS.iter().map(|s| s.to_string()).collect();
+            let mut sys = Vec::new();
+            enum_fonts(&mut sys);
+            for f in sys {
+                if !fonts.contains(&f) {
+                    fonts.push(f);
+                }
+            }
+            for f in &fonts {
+                let w = to_w(f);
                 SendMessageW(cb, CB_ADDSTRING, WPARAM(0), LPARAM(w.as_ptr() as isize));
             }
+            let _ = SetWindowTextW(cb, w!("Calibri"));
             subclass_combo(cb, IDC_FONT_NAME);
         }
         if s.size_combo.get().0.is_null() {

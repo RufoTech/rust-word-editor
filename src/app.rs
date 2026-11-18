@@ -7,6 +7,7 @@ use crate::docx;
 use crate::dropdown::{self, DropIcon, DropItem, ShapeKind, WM_APP_DROPDOWN_PICK};
 use crate::editor::{self, tom_document};
 use crate::format::{self, FormatState};
+use crate::pdf;
 use crate::ribbon;
 use crate::shape::{self, WM_APP_SHAPE_FOCUS_EDIT, WM_APP_SHAPE_SELECT};
 use crate::statusbar;
@@ -194,6 +195,52 @@ pub fn run(hinst: HINSTANCE) -> windows::core::Result<()> {
     }
 }
 
+/// Word's default: Calibri 11 — applied to the selection so the same format
+/// covers new text and is what the ribbon sync shows.
+fn apply_default_font(doc: &ITextDocument) {
+    unsafe {
+        if let Ok(r) = doc.Range(0, editor::story_len(doc)) {
+            if let Ok(f) = r.GetFont() {
+                let _ = f.SetName(&windows::core::BSTR::from("Calibri"));
+                let _ = f.SetSize(11.0);
+            }
+        }
+        if let Ok(sel) = doc.GetSelection() {
+            if let Ok(f) = sel.GetFont() {
+                let _ = f.SetName(&windows::core::BSTR::from("Calibri"));
+                let _ = f.SetSize(11.0);
+            }
+        }
+    }
+}
+
+unsafe fn export_pdf(a: &mut App, path: &str) -> Result<(), String> {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(a.hwnd, &mut rc);
+    let pc = page_content_rect(rc.right - rc.left, rc.bottom - rc.top, &a.page, a.zoom_pct);
+    pdf::export(a.editor, &a.shapes, &a.page, path, pc, a.zoom_pct)
+}
+
+fn pick_pdf_path(hwnd: HWND, cur: Option<&str>) -> Option<String> {
+    unsafe {
+        let dlg: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL).ok()?;
+        let filter = [COMDLG_FILTERSPEC { pszName: w!("PDF Document"), pszSpec: w!("*.pdf") }];
+        let _ = dlg.SetFileTypes(&filter);
+        let _ = dlg.SetDefaultExtension(w!("pdf"));
+        if let Some(c) = cur {
+            let name = Path::new(c).file_stem().unwrap_or_default().to_string_lossy();
+            let w = to_w(&format!("{}.pdf", name));
+            let _ = dlg.SetFileName(PCWSTR(w.as_ptr()));
+        }
+        dlg.Show(hwnd).ok()?;
+        let item = dlg.GetResult().ok()?;
+        let p = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = p.to_string().ok()?;
+        CoTaskMemFree(Some(p.0 as *const _));
+        Some(s)
+    }
+}
+
 fn set_default_text() {
     unsafe {
         let a = app();
@@ -203,6 +250,7 @@ fn set_default_text() {
                     "Type here. Rust Word Editor — Word-ə bənzər redaktor.\r",
                 ));
             }
+            apply_default_font(&doc);
         }
     }
 }
@@ -592,6 +640,7 @@ fn pick_save_path(hwnd: HWND, cur: Option<&str>) -> Option<String> {
             COMDLG_FILTERSPEC { pszName: w!("Word Document"), pszSpec: w!("*.docx") },
             COMDLG_FILTERSPEC { pszName: w!("Rich Text"), pszSpec: w!("*.rtf") },
             COMDLG_FILTERSPEC { pszName: w!("Plain Text"), pszSpec: w!("*.txt") },
+            COMDLG_FILTERSPEC { pszName: w!("PDF Document"), pszSpec: w!("*.pdf") },
         ];
         let _ = dlg.SetFileTypes(&filter);
         let _ = dlg.SetDefaultExtension(w!("docx"));
@@ -650,6 +699,7 @@ fn do_command(id: u32, anchor: RECT) {
                     if let Ok(r) = doc.Range(0, editor::story_len(&doc)) {
                         let _ = r.SetText(&windows::core::BSTR::from(""));
                     }
+                    apply_default_font(&doc);
                 }
                 clear_shapes(a);
                 a.file_path = None;
@@ -694,18 +744,35 @@ fn do_command(id: u32, anchor: RECT) {
                     None => pick_save_path(a.hwnd, a.file_path.as_deref()),
                 };
                 if let Some(p) = chosen {
-                    match docx::save(&p, a.editor, &a.page, &a.shapes) {
+                    let res = if p.to_lowercase().ends_with(".pdf") {
+                        export_pdf(a, &p)
+                    } else {
+                        docx::save(&p, a.editor, &a.page, &a.shapes)
+                    };
+                    match res {
                         Ok(()) => {
-                            a.file_path = Some(p.clone());
-                            backstage::set_doc_name(a.backstage, &p);
-                            if let Some(d) = tom_document(a.editor) {
-                                format::mark_clean(&d);
+                            if !p.to_lowercase().ends_with(".pdf") {
+                                a.file_path = Some(p.clone());
+                                backstage::set_doc_name(a.backstage, &p);
+                                if let Some(d) = tom_document(a.editor) {
+                                    format::mark_clean(&d);
+                                }
                             }
                         }
                         Err(e) => {
                             let msg = to_w(&format!("Save failed: {}", e));
                             MessageBoxW(a.hwnd, PCWSTR(msg.as_ptr()), w!("Rust Word"), MB_ICONERROR);
                         }
+                    }
+                }
+                a.backstage_on = false;
+                layout(a.hwnd);
+            }
+            IDM_EXPORT_PDF => {
+                if let Some(p) = pick_pdf_path(a.hwnd, a.file_path.as_deref()) {
+                    if let Err(e) = export_pdf(a, &p) {
+                        let msg = to_w(&format!("PDF export failed: {}", e));
+                        MessageBoxW(a.hwnd, PCWSTR(msg.as_ptr()), w!("Rust Word"), MB_ICONERROR);
                     }
                 }
                 a.backstage_on = false;

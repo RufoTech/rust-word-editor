@@ -75,6 +75,7 @@ pub const IDM_SHAPE_MARGIN_DLG: u32 = 40082;
 pub const IDM_SHAPE_DELETE: u32 = 40083;
 pub const IDM_SHAPE_BRING_FWD: u32 = 40084;
 pub const IDM_SHAPE_SEND_BACK: u32 = 40085;
+pub const IDM_EXPORT_PDF: u32 = 40086;
 
 // Zoom / view
 pub const IDM_ZOOM_IN: u32 = 40090;

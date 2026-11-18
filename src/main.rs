@@ -7,6 +7,7 @@ mod docx;
 mod dropdown;
 mod editor;
 mod format;
+mod pdf;
 mod ribbon;
 mod shape;
 mod statusbar;

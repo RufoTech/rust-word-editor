@@ -21,6 +21,7 @@ const ITEMS: &[Item] = &[
     Item { id: IDM_OPEN, label: "Open" },
     Item { id: IDM_SAVE, label: "Save" },
     Item { id: IDM_SAVE_AS, label: "Save As" },
+    Item { id: IDM_EXPORT_PDF, label: "Export as PDF" },
     Item { id: IDM_EXIT, label: "Exit" },
 ];
 

@@ -25,7 +25,9 @@ windows = { version = "=0.58.0", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_HiDpi",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Printing",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
 ] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
