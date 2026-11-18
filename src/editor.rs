@@ -84,16 +84,17 @@ pub fn create_editor(parent: HWND, hinst: HINSTANCE, id: u32) -> windows::core::
             hinst,
             None,
         )?;
-        // RichEdit 4.x: notifications
+        // RichEdit 4.x: notifications — only sel/change; key/mouse events are
+        // not consumed anywhere and would flood EN_MSGFILTER per keystroke
         SendMessageW(
             hwnd,
             EM_SETEVENTMASK,
             WPARAM(0),
-            LPARAM(
-                (ENM_SELCHANGE | ENM_CHANGE | ENM_KEYEVENTS | ENM_MOUSEEVENTS) as isize,
-            ),
+            LPARAM((ENM_SELCHANGE | ENM_CHANGE) as isize),
         );
-        SendMessageW(hwnd, EM_SETEDITSTYLE, WPARAM(SES_EMULATESYSEDIT as usize), LPARAM(0));
+        // NOTE: SES_EMULATESYSEDIT must NOT be set — on real msftedit it makes
+        // the control behave like a plain EDIT and formatting stops applying
+        // (Wine stubs the message, which is why the bug only shows on Windows)
         SendMessageW(hwnd, EM_SETTYPOGRAPHYOPTIONS, WPARAM(1), LPARAM(1));
         Ok(hwnd)
     }

@@ -295,7 +295,7 @@ pub fn toggle_bullets(doc: &ITextDocument) {
 
 // ---------- snapshot of selection format (for ribbon state) ----------
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 pub struct FormatState {
     pub font_name: String,
     pub font_size_pt: f32,

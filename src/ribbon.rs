@@ -257,6 +257,7 @@ pub struct RibbonState {
     font_combo: Cell<HWND>,
     size_combo: Cell<HWND>,
     syncing: bool,
+    synced_once: bool,
     pub st: FormatState,
 }
 
@@ -288,6 +289,7 @@ pub fn create(parent: HWND, hinst: HINSTANCE) -> HWND {
             font_combo: Cell::new(HWND::default()),
             size_combo: Cell::new(HWND::default()),
             syncing: false,
+            synced_once: false,
             st: FormatState::default(),
         });
         CreateWindowExW(
@@ -994,6 +996,13 @@ pub fn sync_state(hwnd: HWND, st: &FormatState) {
             return;
         }
         let rs = &mut *s;
+        // msftedit fires EN_SELCHANGE on every caret blink — repainting the
+        // whole ribbon each time flickers constantly and makes the UI feel
+        // dead. Only repaint when the format state actually changed.
+        if rs.synced_once && rs.st == *st {
+            return;
+        }
+        rs.synced_once = true;
         rs.syncing = true;
         rs.st = st.clone();
         let cb = rs.font_combo.get();
